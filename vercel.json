@@ -1,13 +1,1 @@
-{
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "cd artifacts/erp-system && npx vite build",
-  "outputDirectory": "artifacts/erp-system/dist/public",
-  "framework": "vite",
-  "installCommand": "pnpm install --no-frozen-lockfile && pnpm approve-builds esbuild @scarf/scarf",
-  "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": "/index.html"
-    }
-  ]
-}
+{"cleanUrls": true}
