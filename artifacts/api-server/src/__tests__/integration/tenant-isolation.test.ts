@@ -1,0 +1,801 @@
+/**
+ * Multi-Tenant Isolation — Real Integration Tests
+ *
+ * Rules:
+ *  - Zero mocks. @workspace/db is the real connection (DATABASE_URL from env).
+ *  - JWT tokens are signed with the test secret set in setup.ts.
+ *  - The real Express app handles every request via supertest.
+ *  - Assertions rely entirely on actual DB filtering; no manual filtering.
+ *  - Cleanup runs in afterAll regardless of test outcomes.
+ */
+
+import { beforeAll, afterAll, describe, it, expect } from 'vitest';
+import request from 'supertest';
+import jwt from 'jsonwebtoken';
+import { pool } from '@workspace/db';
+import app from '../../app';
+
+/* ── Constants ──────────────────────────────────────────────────── */
+
+// JWT_SECRET is guaranteed to be set by integration/setup.ts (a vitest
+// setupFiles entry that runs before this module is imported).
+
+const JWT_SECRET = process.env.JWT_SECRET!;
+const RUN_ID = Date.now(); // unique tag for this test run
+const PREFIX = `INTTEST_${RUN_ID}`; // safe to grep / delete by
+
+/* ── Shared state (populated in beforeAll) ──────────────────────── */
+
+let companyAId: number;
+let companyBId: number;
+let warehouseAId: number;
+let warehouseBId: number;
+let userAId: number;
+let userBId: number;
+let productAId: number;
+let productBId: number;
+
+let tokenA: string;
+let tokenB: string;
+
+/* Captured from POST responses — used for isolation assertions */
+let saleAId: number;
+let saleBId: number;
+let purchaseAId: number;
+let purchaseBId: number;
+
+/* Voucher cross-tenant isolation fixtures */
+let safeAId: number;
+let customerBId: number;
+
+/* ── Helper: extract id list from GET /sales or /purchases ── */
+interface InvoiceItem {
+  id: number;
+  invoice_no: string;
+}
+function extractInvoices(body: unknown): InvoiceItem[] {
+  if (Array.isArray(body)) return body as InvoiceItem[];
+  const wrapped = body as { data?: InvoiceItem[] };
+  return wrapped.data ?? [];
+}
+function extractIds(body: unknown): number[] {
+  return extractInvoices(body).map((r) => r.id);
+}
+
+/* ── Setup ──────────────────────────────────────────────────────── */
+
+beforeAll(async () => {
+  /* 1. Insert company A (tenant A) with a unique prefix so parallel test
+   *    files do not interfere with each other.  Never TRUNCATE companies —
+   *    that would destroy data owned by concurrently-running test suites. */
+  const coARes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO companies (name, plan_type, start_date, end_date, is_active, email_verified, verification_status)
+    VALUES ($1, 'pro', '2020-01-01', '2099-12-31', true, true, 'verified')
+    RETURNING id
+  `,
+    [`${PREFIX}_CompanyA`]
+  );
+  companyAId = coARes.rows[0].id;
+
+  /* 2. Insert a fresh, isolated test company for tenant B */
+  const coRes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO companies (name, plan_type, start_date, end_date, is_active, email_verified, verification_status)
+    VALUES ($1, 'pro', '2020-01-01', '2099-12-31', true, true, 'verified')
+    RETURNING id
+  `,
+    [`${PREFIX}_CompanyB`]
+  );
+  companyBId = coRes.rows[0].id;
+
+  /* 3. Insert a warehouse per company (required by sales/purchases routes) */
+  const waRes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO warehouses (name, company_id)
+    VALUES ($1, $2)
+    RETURNING id
+  `,
+    [`${PREFIX}_WarehouseA`, companyAId]
+  );
+  warehouseAId = waRes.rows[0].id;
+
+  const wbRes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO warehouses (name, company_id)
+    VALUES ($1, $2)
+    RETURNING id
+  `,
+    [`${PREFIX}_WarehouseB`, companyBId]
+  );
+  warehouseBId = wbRes.rows[0].id;
+
+  /* 4. Insert two admin users — one per company */
+  const uaRes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO erp_users (name, username, pin, role, permissions, active, company_id)
+    VALUES ($1, $2, '0000', 'admin', '{}', true, $3)
+    RETURNING id
+  `,
+    [`${PREFIX}_UserA`, `${PREFIX}_userA`, companyAId]
+  );
+  userAId = uaRes.rows[0].id;
+
+  const ubRes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO erp_users (name, username, pin, role, permissions, active, company_id)
+    VALUES ($1, $2, '0000', 'admin', '{}', true, $3)
+    RETURNING id
+  `,
+    [`${PREFIX}_UserB`, `${PREFIX}_userB`, companyBId]
+  );
+  userBId = ubRes.rows[0].id;
+
+  /* 5. Insert one product per company (quantity=100 so sales stock checks pass) */
+  const paRes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO products (name, sku, quantity, cost_price, sale_price, company_id)
+    VALUES ($1, $2, 100, 10, 20, $3)
+    RETURNING id
+  `,
+    [`${PREFIX}_ProductA`, `${PREFIX}-SKU-A`, companyAId]
+  );
+  productAId = paRes.rows[0].id;
+
+  const pbRes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO products (name, sku, quantity, cost_price, sale_price, company_id)
+    VALUES ($1, $2, 100, 10, 20, $3)
+    RETURNING id
+  `,
+    [`${PREFIX}_ProductB`, `${PREFIX}-SKU-B`, companyBId]
+  );
+  productBId = pbRes.rows[0].id;
+
+  /* 6. Create a safe for company A (used by voucher cross-tenant tests) */
+  const safeRes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO safes (name, balance, company_id)
+    VALUES ($1, 10000, $2)
+    RETURNING id
+  `,
+    [`${PREFIX}_SafeA`, companyAId]
+  );
+  safeAId = safeRes.rows[0].id;
+
+  /* 7. Create a customer for company B (the foreign record tenant A will try to tamper) */
+  const custBRes = await pool.query<{ id: number }>(
+    `
+    INSERT INTO customers (name, customer_code, balance, company_id)
+    VALUES ($1, $2, 500, $3)
+    RETURNING id
+  `,
+    [`${PREFIX}_CustomerB`, RUN_ID % 2147483647, companyBId]
+  );
+  customerBId = custBRes.rows[0].id;
+
+  /* 8. Sign JWT tokens — companyAId captured above, no hardcoded value */
+  tokenA = jwt.sign({ userId: userAId, role: 'admin', companyId: companyAId }, JWT_SECRET, {
+    expiresIn: '1h',
+  });
+  tokenB = jwt.sign({ userId: userBId, role: 'admin', companyId: companyBId }, JWT_SECRET, {
+    expiresIn: '1h',
+  });
+});
+
+/* ── Cleanup ────────────────────────────────────────────────────── */
+
+afterAll(async () => {
+  /*
+   * Delete in correct FK order (no CASCADE defined on most relations).
+   *
+   * journal_entry_lines.entry_id → journal_entries.id
+   * transactions.reference_id → (sale|purchase).id
+   * customer_ledger.reference_id → sale.id
+   * stock_movements.reference_id → (sale|purchase).id
+   * sale_items.sale_id → sales.id
+   * purchase_items.purchase_id → purchases.id
+   */
+  try {
+    const saleIds = [saleAId, saleBId].filter(Number.isFinite);
+    const purchaseIds = [purchaseAId, purchaseBId].filter(Number.isFinite);
+    const allRefIds = [...saleIds, ...purchaseIds];
+    const allRefTexts = allRefIds.map(String);
+
+    /* journal_entry_lines (FK: entry_id → journal_entries.id) */
+    if (allRefTexts.length) {
+      await pool.query(
+        `
+        DELETE FROM journal_entry_lines
+        WHERE entry_id IN (
+          SELECT id FROM journal_entries
+          WHERE company_id = $2 AND reference = ANY($1::text[])
+        )
+      `,
+        [allRefTexts, companyAId]
+      );
+    }
+    await pool.query(
+      `
+      DELETE FROM journal_entry_lines
+      WHERE entry_id IN (
+        SELECT id FROM journal_entries WHERE company_id = $1
+      )
+    `,
+      [companyBId]
+    );
+
+    /* journal_entries */
+    if (allRefTexts.length) {
+      await pool.query(
+        `
+        DELETE FROM journal_entries
+        WHERE company_id = $2 AND reference = ANY($1::text[])
+      `,
+        [allRefTexts, companyAId]
+      );
+    }
+    await pool.query(`DELETE FROM journal_entries WHERE company_id = $1`, [companyBId]);
+
+    /* transactions */
+    if (saleIds.length) {
+      await pool.query(
+        `
+        DELETE FROM transactions
+        WHERE company_id = $2
+          AND reference_type = 'sale'
+          AND reference_id = ANY($1::int[])
+      `,
+        [saleIds, companyAId]
+      );
+    }
+    if (purchaseIds.length) {
+      await pool.query(
+        `
+        DELETE FROM transactions
+        WHERE company_id = $2
+          AND reference_type = 'purchase'
+          AND reference_id = ANY($1::int[])
+      `,
+        [purchaseIds, companyAId]
+      );
+    }
+    await pool.query(`DELETE FROM transactions WHERE company_id = $1`, [companyBId]);
+
+    /* customer_ledger */
+    if (saleIds.length) {
+      await pool.query(
+        `
+        DELETE FROM customer_ledger
+        WHERE company_id = $2 AND reference_id = ANY($1::int[])
+      `,
+        [saleIds, companyAId]
+      );
+    }
+    await pool.query(`DELETE FROM customer_ledger WHERE company_id = $1`, [companyBId]);
+
+    /* stock_movements */
+    if (saleIds.length) {
+      await pool.query(
+        `
+        DELETE FROM stock_movements
+        WHERE company_id = $2
+          AND reference_type = 'sale'
+          AND reference_id = ANY($1::int[])
+      `,
+        [saleIds, companyAId]
+      );
+    }
+    if (purchaseIds.length) {
+      await pool.query(
+        `
+        DELETE FROM stock_movements
+        WHERE company_id = $2
+          AND reference_type = 'purchase'
+          AND reference_id = ANY($1::int[])
+      `,
+        [purchaseIds, companyAId]
+      );
+    }
+    await pool.query(`DELETE FROM stock_movements WHERE company_id = $1`, [companyBId]);
+
+    /* sale_items → sales */
+    if (saleIds.length) {
+      await pool.query(`DELETE FROM sale_items   WHERE sale_id     = ANY($1::int[])`, [saleIds]);
+      await pool.query(
+        `DELETE FROM sales        WHERE id          = ANY($1::int[]) AND company_id = $2`,
+        [saleIds, companyAId]
+      );
+    }
+    await pool.query(
+      `
+      DELETE FROM sale_items WHERE sale_id IN (SELECT id FROM sales WHERE company_id = $1)
+    `,
+      [companyBId]
+    );
+    await pool.query(`DELETE FROM sales WHERE company_id = $1`, [companyBId]);
+
+    /* purchase_items → purchases */
+    if (purchaseIds.length) {
+      await pool.query(`DELETE FROM purchase_items WHERE purchase_id = ANY($1::int[])`, [
+        purchaseIds,
+      ]);
+      await pool.query(
+        `DELETE FROM purchases      WHERE id          = ANY($1::int[]) AND company_id = $2`,
+        [purchaseIds, companyAId]
+      );
+    }
+    await pool.query(
+      `
+      DELETE FROM purchase_items WHERE purchase_id IN (SELECT id FROM purchases WHERE company_id = $1)
+    `,
+      [companyBId]
+    );
+    await pool.query(`DELETE FROM purchases WHERE company_id = $1`, [companyBId]);
+
+    /* products */
+    await pool.query(
+      `
+      DELETE FROM products WHERE id = ANY($1::int[])
+    `,
+      [[productAId, productBId].filter(Number.isFinite)]
+    );
+
+    /* audit_logs keyed on the test user IDs */
+    await pool.query(
+      `
+      DELETE FROM audit_logs WHERE user_id = ANY($1::int[])
+    `,
+      [[userAId, userBId].filter(Number.isFinite)]
+    );
+
+    /* erp_users */
+    await pool.query(
+      `
+      DELETE FROM erp_users WHERE id = ANY($1::int[])
+    `,
+      [[userAId, userBId].filter(Number.isFinite)]
+    );
+
+    /* receipt_vouchers and payment_vouchers created during voucher isolation tests */
+    await pool.query(`DELETE FROM receipt_vouchers WHERE company_id = $1`, [companyAId]);
+    await pool.query(`DELETE FROM payment_vouchers WHERE company_id = $1`, [companyAId]);
+
+    /* safes created for voucher tests */
+    if (safeAId) {
+      await pool.query(`DELETE FROM safes WHERE id = $1`, [safeAId]);
+    }
+
+    /* customers created for voucher cross-tenant tests */
+    if (customerBId) {
+      await pool.query(`DELETE FROM customer_ledger WHERE customer_id = $1`, [customerBId]);
+      await pool.query(`DELETE FROM customers WHERE id = $1`, [customerBId]);
+    }
+
+    /* warehouses */
+    await pool.query(
+      `
+      DELETE FROM warehouses WHERE id = ANY($1::int[])
+    `,
+      [[warehouseAId, warehouseBId].filter(Number.isFinite)]
+    );
+
+    /* companies A and B */
+    if (companyBId) {
+      await pool.query(`DELETE FROM companies WHERE id = $1`, [companyBId]);
+    }
+    if (companyAId) {
+      await pool.query(`DELETE FROM companies WHERE id = $1`, [companyAId]);
+    }
+  } catch (err) {
+    console.error('[integration cleanup] error:', err);
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   TESTS
+   ═══════════════════════════════════════════════════════════════════ */
+
+describe('Multi-Tenant Isolation — Sales', () => {
+  it('POST /api/sales — company A creates a sale (201)', async () => {
+    const res = await request(app)
+      .post('/api/sales')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .set('X-Request-Id', `${PREFIX}-sale-A`)
+      .set('Content-Type', 'application/json')
+      .send({
+        payment_type: 'credit',
+        total_amount: 20,
+        paid_amount: 0,
+        warehouse_id: warehouseAId,
+        items: [
+          {
+            product_id: productAId,
+            product_name: `${PREFIX}_ProductA`,
+            quantity: 1,
+            unit_price: 20,
+            total_price: 20,
+          },
+        ],
+      });
+
+    if (res.status !== 201) {
+      console.error('POST /api/sales company A failed:', JSON.stringify(res.body));
+    }
+    expect(res.status).toBe(201);
+    expect(res.body.invoice_no).toBeTruthy();
+    saleAId = res.body.id as number;
+  });
+
+  it('POST /api/sales — company B creates a sale (201)', async () => {
+    const res = await request(app)
+      .post('/api/sales')
+      .set('Authorization', `Bearer ${tokenB}`)
+      .set('X-Request-Id', `${PREFIX}-sale-B`)
+      .set('Content-Type', 'application/json')
+      .send({
+        payment_type: 'credit',
+        total_amount: 20,
+        paid_amount: 0,
+        warehouse_id: warehouseBId,
+        items: [
+          {
+            product_id: productBId,
+            product_name: `${PREFIX}_ProductB`,
+            quantity: 1,
+            unit_price: 20,
+            total_price: 20,
+          },
+        ],
+      });
+
+    if (res.status !== 201) {
+      console.error('POST /api/sales company B failed:', JSON.stringify(res.body));
+    }
+    expect(res.status).toBe(201);
+    expect(res.body.invoice_no).toBeTruthy();
+    saleBId = res.body.id as number;
+  });
+
+  it('GET /api/sales with tokenA — returns own sale, NEVER company B sale', async () => {
+    expect(saleAId, 'POST company A sale must have succeeded first').toBeTruthy();
+    expect(saleBId, 'POST company B sale must have succeeded first').toBeTruthy();
+
+    const res = await request(app).get('/api/sales').set('Authorization', `Bearer ${tokenA}`);
+
+    expect(res.status).toBe(200);
+
+    const ids = extractIds(res.body);
+
+    expect(ids, 'company A token must see its own sale').toContain(saleAId);
+    expect(ids, 'company A token must NOT see company B sale').not.toContain(saleBId);
+  });
+
+  it('GET /api/sales with tokenB — returns own sale, NEVER company A sale', async () => {
+    expect(saleAId, 'POST company A sale must have succeeded first').toBeTruthy();
+    expect(saleBId, 'POST company B sale must have succeeded first').toBeTruthy();
+
+    const res = await request(app).get('/api/sales').set('Authorization', `Bearer ${tokenB}`);
+
+    expect(res.status).toBe(200);
+
+    const ids = extractIds(res.body);
+
+    expect(ids, 'company B token must see its own sale').toContain(saleBId);
+    expect(ids, 'company B token must NOT see company A sale').not.toContain(saleAId);
+  });
+});
+
+describe('Multi-Tenant Isolation — Purchases', () => {
+  it('POST /api/purchases — company A creates a purchase (201)', async () => {
+    const res = await request(app)
+      .post('/api/purchases')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .set('X-Request-Id', `${PREFIX}-purchase-A`)
+      .set('Content-Type', 'application/json')
+      .send({
+        payment_type: 'credit',
+        total_amount: 10,
+        paid_amount: 0,
+        supplier_name: `${PREFIX}_SupplierA`,
+        warehouse_id: warehouseAId,
+        items: [
+          {
+            product_id: productAId,
+            product_name: `${PREFIX}_ProductA`,
+            quantity: 1,
+            unit_price: 10,
+            total_price: 10,
+          },
+        ],
+      });
+
+    if (res.status !== 201) {
+      console.error('POST /api/purchases company A failed:', JSON.stringify(res.body));
+    }
+    expect(res.status).toBe(201);
+    expect(res.body.invoice_no).toBeTruthy();
+    purchaseAId = res.body.id as number;
+  });
+
+  it('POST /api/purchases — company B creates a purchase (201)', async () => {
+    const res = await request(app)
+      .post('/api/purchases')
+      .set('Authorization', `Bearer ${tokenB}`)
+      .set('X-Request-Id', `${PREFIX}-purchase-B`)
+      .set('Content-Type', 'application/json')
+      .send({
+        payment_type: 'credit',
+        total_amount: 10,
+        paid_amount: 0,
+        supplier_name: `${PREFIX}_SupplierB`,
+        warehouse_id: warehouseBId,
+        items: [
+          {
+            product_id: productBId,
+            product_name: `${PREFIX}_ProductB`,
+            quantity: 1,
+            unit_price: 10,
+            total_price: 10,
+          },
+        ],
+      });
+
+    if (res.status !== 201) {
+      console.error('POST /api/purchases company B failed:', JSON.stringify(res.body));
+    }
+    expect(res.status).toBe(201);
+    expect(res.body.invoice_no).toBeTruthy();
+    purchaseBId = res.body.id as number;
+  });
+
+  it('GET /api/purchases with tokenA — returns own purchase, NEVER company B purchase', async () => {
+    expect(purchaseAId, 'POST company A purchase must have succeeded first').toBeTruthy();
+    expect(purchaseBId, 'POST company B purchase must have succeeded first').toBeTruthy();
+
+    const res = await request(app).get('/api/purchases').set('Authorization', `Bearer ${tokenA}`);
+
+    expect(res.status).toBe(200);
+
+    const ids = extractIds(res.body);
+
+    expect(ids, 'company A token must see its own purchase').toContain(purchaseAId);
+    expect(ids, 'company A token must NOT see company B purchase').not.toContain(purchaseBId);
+  });
+
+  it('GET /api/purchases with tokenB — returns own purchase, NEVER company A purchase', async () => {
+    expect(purchaseAId, 'POST company A purchase must have succeeded first').toBeTruthy();
+    expect(purchaseBId, 'POST company B purchase must have succeeded first').toBeTruthy();
+
+    const res = await request(app).get('/api/purchases').set('Authorization', `Bearer ${tokenB}`);
+
+    expect(res.status).toBe(200);
+
+    const ids = extractIds(res.body);
+
+    expect(ids, 'company B token must see its own purchase').toContain(purchaseBId);
+    expect(ids, 'company B token must NOT see company A purchase').not.toContain(purchaseAId);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   BY-ID ISOLATION — cross-tenant read/mutate on single records
+   ═══════════════════════════════════════════════════════════════════ */
+
+describe('Multi-Tenant Isolation — Sales by ID (cross-tenant blocked)', () => {
+  it('GET /api/sales/:id with tokenA — can read own sale', async () => {
+    expect(saleAId, 'sale A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .get(`/api/sales/${saleAId}`)
+      .set('Authorization', `Bearer ${tokenA}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(saleAId);
+  });
+
+  it('GET /api/sales/:id with tokenB using company A sale ID — blocked (403 or 404)', async () => {
+    expect(saleAId, 'sale A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .get(`/api/sales/${saleAId}`)
+      .set('Authorization', `Bearer ${tokenB}`);
+
+    expect([403, 404], 'cross-tenant access must be blocked').toContain(res.status);
+  });
+
+  it('POST /api/sales/:id/post with tokenB using company A sale ID — blocked (403 or 404)', async () => {
+    expect(saleAId, 'sale A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .post(`/api/sales/${saleAId}/post`)
+      .set('Authorization', `Bearer ${tokenB}`);
+
+    expect([403, 404], 'cross-tenant access must be blocked').toContain(res.status);
+  });
+
+  it('POST /api/sales/:id/cancel with tokenB using company A sale ID — blocked (403 or 404)', async () => {
+    expect(saleAId, 'sale A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .post(`/api/sales/${saleAId}/cancel`)
+      .set('Authorization', `Bearer ${tokenB}`);
+
+    expect([403, 404], 'cross-tenant access must be blocked').toContain(res.status);
+  });
+
+  it('GET /api/sales/:id with tokenB — can read own sale', async () => {
+    expect(saleBId, 'sale B must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .get(`/api/sales/${saleBId}`)
+      .set('Authorization', `Bearer ${tokenB}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(saleBId);
+  });
+
+  it('GET /api/sales/:id with tokenA using company B sale ID — blocked (403 or 404)', async () => {
+    expect(saleBId, 'sale B must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .get(`/api/sales/${saleBId}`)
+      .set('Authorization', `Bearer ${tokenA}`);
+
+    expect([403, 404], 'cross-tenant access must be blocked').toContain(res.status);
+  });
+});
+
+describe('Multi-Tenant Isolation — Purchases by ID (cross-tenant blocked)', () => {
+  it('GET /api/purchases/:id with tokenA — can read own purchase', async () => {
+    expect(purchaseAId, 'purchase A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .get(`/api/purchases/${purchaseAId}`)
+      .set('Authorization', `Bearer ${tokenA}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(purchaseAId);
+  });
+
+  it('GET /api/purchases/:id with tokenB using company A purchase ID — blocked (403 or 404)', async () => {
+    expect(purchaseAId, 'purchase A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .get(`/api/purchases/${purchaseAId}`)
+      .set('Authorization', `Bearer ${tokenB}`);
+
+    expect([403, 404], 'cross-tenant access must be blocked').toContain(res.status);
+  });
+
+  it('POST /api/purchases/:id/post with tokenB using company A purchase ID — blocked (403 or 404)', async () => {
+    expect(purchaseAId, 'purchase A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .post(`/api/purchases/${purchaseAId}/post`)
+      .set('Authorization', `Bearer ${tokenB}`);
+
+    expect([403, 404], 'cross-tenant access must be blocked').toContain(res.status);
+  });
+
+  it('POST /api/purchases/:id/cancel with tokenB using company A purchase ID — blocked (403 or 404)', async () => {
+    expect(purchaseAId, 'purchase A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .post(`/api/purchases/${purchaseAId}/cancel`)
+      .set('Authorization', `Bearer ${tokenB}`);
+
+    expect([403, 404], 'cross-tenant access must be blocked').toContain(res.status);
+  });
+
+  it('GET /api/purchases/:id with tokenB — can read own purchase', async () => {
+    expect(purchaseBId, 'purchase B must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .get(`/api/purchases/${purchaseBId}`)
+      .set('Authorization', `Bearer ${tokenB}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(purchaseBId);
+  });
+
+  it('GET /api/purchases/:id with tokenA using company B purchase ID — blocked (403 or 404)', async () => {
+    expect(purchaseBId, 'purchase B must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .get(`/api/purchases/${purchaseBId}`)
+      .set('Authorization', `Bearer ${tokenA}`);
+
+    expect([403, 404], 'cross-tenant access must be blocked').toContain(res.status);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   VOUCHER CROSS-TENANT customer_id REJECTION
+   An attacker from tenant A must not be able to reference tenant B's
+   customer_id in receipt or payment vouchers. The fix ensures the
+   supplied customer_id is verified to belong to the caller's tenant
+   before the voucher is stored; a foreign ID must be rejected (400).
+   ═══════════════════════════════════════════════════════════════════ */
+
+describe('Voucher Cross-Tenant Isolation — receipt-voucher customer_id rejection', () => {
+  it('POST /api/receipt-vouchers with tokenA and customer_id belonging to company B — rejected (400)', async () => {
+    expect(safeAId, 'safe A must have been created').toBeTruthy();
+    expect(customerBId, 'customer B must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .post('/api/receipt-vouchers')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .set('Content-Type', 'application/json')
+      .send({
+        customer_id: customerBId,
+        customer_name: 'Cross-Tenant Attack',
+        safe_id: safeAId,
+        amount: 100,
+        date: new Date().toISOString().split('T')[0],
+      });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /api/receipt-vouchers with tokenA and own customer_id (undefined) — succeeds (201)', async () => {
+    expect(safeAId, 'safe A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .post('/api/receipt-vouchers')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .set('Content-Type', 'application/json')
+      .send({
+        customer_name: 'Walk-In Customer',
+        safe_id: safeAId,
+        amount: 50,
+        date: new Date().toISOString().split('T')[0],
+      });
+
+    if (res.status !== 201) {
+      console.error('receipt-voucher no customer_id failed:', JSON.stringify(res.body));
+    }
+    expect(res.status).toBe(201);
+  });
+});
+
+describe('Voucher Cross-Tenant Isolation — payment-voucher customer_id rejection', () => {
+  it('POST /api/payment-vouchers with tokenA and customer_id belonging to company B — rejected (400)', async () => {
+    expect(safeAId, 'safe A must have been created').toBeTruthy();
+    expect(customerBId, 'customer B must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .post('/api/payment-vouchers')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .set('Content-Type', 'application/json')
+      .send({
+        customer_id: customerBId,
+        customer_name: 'Cross-Tenant Attack',
+        safe_id: safeAId,
+        amount: 100,
+        date: new Date().toISOString().split('T')[0],
+      });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /api/payment-vouchers with tokenA and no customer_id — succeeds (201)', async () => {
+    expect(safeAId, 'safe A must have been created').toBeTruthy();
+
+    const res = await request(app)
+      .post('/api/payment-vouchers')
+      .set('Authorization', `Bearer ${tokenA}`)
+      .set('Content-Type', 'application/json')
+      .send({
+        customer_name: 'Generic Payee',
+        safe_id: safeAId,
+        amount: 25,
+        date: new Date().toISOString().split('T')[0],
+      });
+
+    if (res.status !== 201) {
+      console.error('payment-voucher no customer_id failed:', JSON.stringify(res.body));
+    }
+    expect(res.status).toBe(201);
+  });
+});

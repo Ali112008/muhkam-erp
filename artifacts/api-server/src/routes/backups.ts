@@ -1,0 +1,159 @@
+/**
+ * /api/backups  — list, download, delete server-side backups
+ */
+
+import { Router, type IRouter } from "express";
+import fs from "node:fs";
+import path from "node:path";
+import { db, backupsTable, systemSettingsTable } from "@workspace/db";
+import { eq, and, desc } from "drizzle-orm";
+import { authenticate, requireRole } from "../middleware/auth";
+import { wrap, httpError } from "../lib/async-handler";
+import { triggerBackup, isBackupInProgress, BACKUP_DIR } from "../lib/backup-service";
+
+const router: IRouter = Router();
+
+/* الـ company_id المستخدم لإعدادات النسخ الاحتياطي — إعدادات النظام العامة */
+const BACKUP_COMPANY_ID = 1;
+
+/* أداة upsert صحيحة باستخدام compound unique (key, company_id) */
+async function upsertBackupSetting(key: string, value: string) {
+  await db.insert(systemSettingsTable)
+    .values({ key, value, company_id: BACKUP_COMPANY_ID })
+    .onConflictDoUpdate({
+      target: [systemSettingsTable.key, systemSettingsTable.company_id],
+      set: { value, updated_at: new Date() },
+    });
+}
+
+async function getBackupSetting(key: string): Promise<string | null> {
+  const [row] = await db.select().from(systemSettingsTable)
+    .where(and(eq(systemSettingsTable.key, key), eq(systemSettingsTable.company_id, BACKUP_COMPANY_ID)));
+  return row?.value ?? null;
+}
+
+/* ── GET /api/backups/settings ── ────────────────────────────── */
+router.get("/backups/settings", authenticate, requireRole("super_admin"), wrap(async (_req, res) => {
+  /* All backup settings are scoped to the dedicated BACKUP_COMPANY_ID row to
+     avoid collisions with tenant system_settings entries of the same key. */
+  const pick = (key: string) =>
+    db.select().from(systemSettingsTable)
+      .where(and(eq(systemSettingsTable.key, key), eq(systemSettingsTable.company_id, BACKUP_COMPANY_ID)))
+      .then(r => r[0]);
+  const [schedRow, destRow, lastRow, onLoginRow, onLogoutRow] = await Promise.all([
+    pick("backup_schedule"),
+    pick("backup_destination"),
+    pick("backup_last_scheduled"),
+    pick("backup_on_login"),
+    pick("backup_on_logout"),
+  ]);
+
+  res.json({
+    schedule:       schedRow?.value    ?? "none",
+    destination:    destRow?.value     ?? "local",
+    last_scheduled: lastRow?.value     ?? null,
+    on_login:       onLoginRow?.value  === "true",
+    on_logout:      onLogoutRow?.value === "true",
+  });
+}));
+
+/* ── PUT /api/backups/settings ── ────────────────────────────── */
+router.put("/backups/settings", authenticate, requireRole("super_admin"), wrap(async (req, res) => {
+  const { schedule, destination, on_login, on_logout } = req.body as {
+    schedule?:    string;
+    destination?: string;
+    on_login?:    boolean;
+    on_logout?:   boolean;
+  };
+
+  const validSchedules    = ["none", "daily", "weekly", "monthly"];
+  const validDestinations = ["local", "server"];
+
+  if (schedule    !== undefined && !validSchedules.includes(schedule))       throw httpError(400, `جدول غير صالح: ${schedule}`);
+  if (destination !== undefined && !validDestinations.includes(destination)) throw httpError(400, `وجهة غير صالحة: ${destination}`);
+
+  await Promise.all([
+    schedule    !== undefined ? upsertBackupSetting("backup_schedule",    schedule)              : Promise.resolve(),
+    destination !== undefined ? upsertBackupSetting("backup_destination", destination)            : Promise.resolve(),
+    on_login    !== undefined ? upsertBackupSetting("backup_on_login",    on_login  ? "true" : "false") : Promise.resolve(),
+    on_logout   !== undefined ? upsertBackupSetting("backup_on_logout",   on_logout ? "true" : "false") : Promise.resolve(),
+  ]);
+
+  res.json({ success: true });
+}));
+
+/* ── GET /api/backups ── list all ─────────────────────────────── */
+router.get("/backups", authenticate, requireRole("super_admin"), wrap(async (_req, res) => {
+  const list = await db.select().from(backupsTable).orderBy(desc(backupsTable.created_at)).limit(100);
+  res.json(list);
+}));
+
+/* ── POST /api/backups ── trigger manual server backup ─────────── */
+router.post("/backups", authenticate, requireRole("super_admin"), wrap(async (_req, res) => {
+  if (isBackupInProgress()) {
+    res.status(409).json({ error: "جارٍ تنفيذ نسخة احتياطية حالياً، انتظر قليلاً" });
+    return;
+  }
+  const record = await triggerBackup("manual");
+  if (!record) { res.status(500).json({ error: "فشل إنشاء النسخة الاحتياطية" }); return; }
+  res.status(201).json(record);
+}));
+
+/* ── GET /api/backups/:id/download ─────────────────────────────── */
+router.get("/backups/:id/download", authenticate, requireRole("super_admin"), wrap(async (req, res) => {
+  const id = parseInt(req.params.id as string);
+  if (isNaN(id)) throw httpError(400, "معرّف غير صحيح");
+
+  const [record] = await db.select().from(backupsTable).where(eq(backupsTable.id, id));
+  if (!record) throw httpError(404, "النسخة الاحتياطية غير موجودة");
+
+  /* منع Path Traversal — التحقق أن المسار داخل مجلد النسخ الاحتياطية فقط */
+  const safeBase = path.resolve(BACKUP_DIR);
+  const safepath = path.resolve(BACKUP_DIR, path.basename(record.filename));
+  if (!safepath.startsWith(safeBase + path.sep) && safepath !== safeBase) {
+    throw httpError(403, "مسار الملف غير مسموح به");
+  }
+
+  // eslint-disable-next-line security/detect-non-literal-fs-filename
+  if (!fs.existsSync(safepath)) throw httpError(404, "الملف غير موجود على الخادم");
+
+  const safeFilename = path.basename(record.filename).replace(/[^\w.\-]/g, "_");
+  /* Encrypted backups (.enc) are binary AES-256-GCM blobs; set octet-stream
+     so the browser saves them verbatim without trying to render them. */
+  const isEnc = safeFilename.endsWith(".enc");
+  res.setHeader("Content-Type", isEnc ? "application/octet-stream" : "application/json");
+  if (isEnc) res.setHeader("X-Backup-Encrypted", "aes-256-gcm");
+  res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
+  res.sendFile(safepath);
+}));
+
+/* ── DELETE /api/backups/:id ─────────────────────────────────── */
+router.delete("/backups/:id", authenticate, requireRole("super_admin"), wrap(async (req, res) => {
+  const id = parseInt(req.params.id as string);
+  if (isNaN(id)) throw httpError(400, "معرّف غير صحيح");
+
+  const [record] = await db.select().from(backupsTable).where(eq(backupsTable.id, id));
+  if (!record) throw httpError(404, "النسخة الاحتياطية غير موجودة");
+
+  /* منع Path Traversal عند الحذف */
+  const safeBase = path.resolve(BACKUP_DIR);
+  const filepath = path.resolve(BACKUP_DIR, path.basename(record.filename));
+  if (!filepath.startsWith(safeBase + path.sep) && filepath !== safeBase) {
+    throw httpError(403, "مسار الملف غير مسموح به");
+  }
+  // eslint-disable-next-line security/detect-non-literal-fs-filename
+  if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
+
+  await db.delete(backupsTable).where(eq(backupsTable.id, id));
+  res.json({ success: true, message: "تم حذف النسخة الاحتياطية" });
+}));
+
+/* ── مساعدة خارجية: فحص إعداد النسخ عند الدخول/الخروج ─────────── */
+export async function isBackupOnLoginEnabled():  Promise<boolean> {
+  const v = await getBackupSetting("backup_on_login");  return v === "true";
+}
+export async function isBackupOnLogoutEnabled(): Promise<boolean> {
+  const v = await getBackupSetting("backup_on_logout"); return v === "true";
+}
+
+export default router;

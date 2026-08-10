@@ -1,0 +1,288 @@
+name: Deploy to Production
+
+on:
+  workflow_run:
+    workflows: ["CI — Lint, Type Check, Test, Build"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration-test:
+    name: Multi-Tenant Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Push database schema to test DB
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/testdb
+        run: pnpm --filter @workspace/db run push-force
+
+      - name: Run multi-tenant isolation tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/testdb
+          JWT_SECRET: ci-integration-test-jwt-secret-minimum-32chars!!
+          JWT_REFRESH_SECRET: ci-integration-test-jwt-refresh-secret-min-32chars!!
+          NODE_ENV: test
+        run: pnpm --filter @workspace/api-server run test:integration
+
+  deploy:
+    name: Deploy to Hetzner VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [integration-test]
+    if: |
+      always() &&
+      needs.integration-test.result == 'success' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'schedule' ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_branch == 'main'
+        )
+      )
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          command_timeout: 15m
+          envs: DEPLOY_TOKEN,SUPER_ADMIN_PIN,RESEND_API_KEY
+          script: |
+            set -euo pipefail
+            APP_DIR=/var/www/muhkam-erp
+            cd "$APP_DIR"
+
+            # Load environment variables (DATABASE_URL, JWT_SECRET, etc.)
+            if [ -f "$APP_DIR/.env" ]; then
+              set -a
+              source "$APP_DIR/.env"
+              set +a
+            fi
+
+            # Auto-generate missing encryption keys on server (idempotent — only added once)
+            ENV_FILE="$APP_DIR/.env"
+            touch "$ENV_FILE"
+            if ! grep -q "^TOTP_ENCRYPTION_KEY=" "$ENV_FILE" 2>/dev/null; then
+              echo "TOTP_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$ENV_FILE"
+              echo "✓ Generated TOTP_ENCRYPTION_KEY"
+            fi
+            if ! grep -q "^BACKUP_ENCRYPTION_KEY=" "$ENV_FILE" 2>/dev/null; then
+              echo "BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> "$ENV_FILE"
+              echo "✓ Generated BACKUP_ENCRYPTION_KEY"
+            fi
+            if ! grep -q "^BACKUP_DIR=" "$ENV_FILE" 2>/dev/null; then
+              echo "BACKUP_DIR=/home/deploy/muhkam-backups/db" >> "$ENV_FILE"
+              echo "✓ Added production BACKUP_DIR"
+            fi
+            if ! grep -q "^BACKUP_PGDUMP_DOCKER_IMAGE=" "$ENV_FILE" 2>/dev/null; then
+              echo "BACKUP_PGDUMP_DOCKER_IMAGE=postgres:17" >> "$ENV_FILE"
+              echo "✓ Added production BACKUP_PGDUMP_DOCKER_IMAGE"
+            fi
+            if ! grep -q "^BACKUP_AWS_CLI_DOCKER_IMAGE=" "$ENV_FILE" 2>/dev/null; then
+              echo "BACKUP_AWS_CLI_DOCKER_IMAGE=amazon/aws-cli" >> "$ENV_FILE"
+              echo "✓ Added production BACKUP_AWS_CLI_DOCKER_IMAGE"
+            fi
+            # Add SUPER_ADMIN_IPS placeholder if missing (admin must fill it in .env manually)
+            if ! grep -q "^SUPER_ADMIN_IPS=" "$ENV_FILE" 2>/dev/null; then
+              echo "SUPER_ADMIN_IPS=" >> "$ENV_FILE"
+              echo "⚠️  SUPER_ADMIN_IPS is empty — super-admin access is BLOCKED in production. Add your IP(s) to .env"
+            fi
+            # Inject SUPER_ADMIN_PIN from GitHub secret (passed via envs:)
+            if [ -n "${SUPER_ADMIN_PIN:-}" ]; then
+              if grep -q "^SUPER_ADMIN_PIN=" "$ENV_FILE" 2>/dev/null; then
+                sed -i "s|^SUPER_ADMIN_PIN=.*|SUPER_ADMIN_PIN=$SUPER_ADMIN_PIN|" "$ENV_FILE"
+              else
+                echo "SUPER_ADMIN_PIN=$SUPER_ADMIN_PIN" >> "$ENV_FILE"
+              fi
+              echo "✓ SUPER_ADMIN_PIN written to .env"
+            fi
+
+            # Re-source .env to pick up all vars (including newly generated ones)
+            set -a
+            source "$ENV_FILE"
+            set +a
+
+            # التحقق من وجود جميع المتغيرات المطلوبة
+            : "${JWT_SECRET:?خطأ: JWT_SECRET غير موجود في ملف .env}"
+            : "${JWT_REFRESH_SECRET:?خطأ: JWT_REFRESH_SECRET غير موجود في ملف .env}"
+            : "${DATABASE_URL:?خطأ: DATABASE_URL غير موجود في ملف .env}"
+            : "${TOTP_ENCRYPTION_KEY:?BUG: فشل توليد TOTP_ENCRYPTION_KEY}"
+            : "${BACKUP_ENCRYPTION_KEY:?BUG: فشل توليد BACKUP_ENCRYPTION_KEY}"
+            : "${BACKUP_DIR:?خطأ: BACKUP_DIR غير موجود في ملف .env}"
+            : "${BACKUP_PGDUMP_DOCKER_IMAGE:?خطأ: BACKUP_PGDUMP_DOCKER_IMAGE غير موجود في ملف .env}"
+            : "${BACKUP_AWS_CLI_DOCKER_IMAGE:?خطأ: BACKUP_AWS_CLI_DOCKER_IMAGE غير موجود في ملف .env}"
+            : "${R2_ENDPOINT:?خطأ: R2_ENDPOINT غير موجود في ملف .env}"
+            : "${R2_BUCKET:?خطأ: R2_BUCKET غير موجود في ملف .env}"
+            : "${R2_ACCESS_KEY_ID:?خطأ: R2_ACCESS_KEY_ID غير موجود في ملف .env}"
+            : "${R2_SECRET_ACCESS_KEY:?خطأ: R2_SECRET_ACCESS_KEY غير موجود في ملف .env}"
+
+            mkdir -p "$BACKUP_DIR"
+            chmod 700 "$(dirname "$BACKUP_DIR")" "$BACKUP_DIR"
+
+            # Authenticate git with token (GitHub no longer accepts passwords)
+            git remote set-url origin "https://x-access-token:${DEPLOY_TOKEN}@github.com/m4elmelegy-hub/MUHKAM-ERP.git"
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd --exclude=.env
+            # Remove token from remote URL after pull (security hygiene)
+            git remote set-url origin "https://github.com/m4elmelegy-hub/MUHKAM-ERP.git"
+
+            pnpm install --frozen-lockfile
+
+            # Versioned migrations: baseline adopted; push-force remains available as manual fallback
+            cd "$APP_DIR/lib/db"
+            pnpm run migrate
+
+            cd "$APP_DIR/artifacts/erp-system"
+            NODE_ENV=production BASE_PATH=/ VITE_API_URL="" VITE_SENTRY_DSN="${SENTRY_DSN:-}" pnpm run build
+
+            cd "$APP_DIR/artifacts/api-server"
+            pnpm run build
+
+            # Stop old process cleanly before starting fresh with correct env
+            pm2 delete muhkam-api || true
+
+            # Start with all required env vars passed explicitly (no reliance on --update-env)
+            # Optional vars (REDIS_URL/REDIS_HOST, TELEGRAM_*, SUPER_ADMIN_IPS) are passed if present in .env
+            NODE_ENV=production \
+              PORT=8080 \
+              JWT_SECRET="$JWT_SECRET" \
+              JWT_REFRESH_SECRET="$JWT_REFRESH_SECRET" \
+              DATABASE_URL="$DATABASE_URL" \
+              TOTP_ENCRYPTION_KEY="$TOTP_ENCRYPTION_KEY" \
+              BACKUP_ENCRYPTION_KEY="$BACKUP_ENCRYPTION_KEY" \
+              BACKUP_DIR="$BACKUP_DIR" \
+              BACKUP_PGDUMP_DOCKER_IMAGE="$BACKUP_PGDUMP_DOCKER_IMAGE" \
+              BACKUP_AWS_CLI_DOCKER_IMAGE="$BACKUP_AWS_CLI_DOCKER_IMAGE" \
+              R2_ENDPOINT="$R2_ENDPOINT" \
+              R2_BUCKET="$R2_BUCKET" \
+              R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+              R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+              R2_BACKUP_PREFIX="${R2_BACKUP_PREFIX:-db}" \
+              SUPER_ADMIN_IPS="${SUPER_ADMIN_IPS:-}" \
+              REDIS_URL="${REDIS_URL:-}" \
+              REDIS_HOST="${REDIS_HOST:-}" \
+              REDIS_PORT="${REDIS_PORT:-}" \
+              REDIS_PASSWORD="${REDIS_PASSWORD:-}" \
+              TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
+              TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
+              SENTRY_DSN="${SENTRY_DSN:-}" \
+              SUPPORT_WHATSAPP="${SUPPORT_WHATSAPP:-}" \
+              SUPPORT_EMAIL="${SUPPORT_EMAIL:-}" \
+              RESEND_API_KEY="${RESEND_API_KEY:-}" \
+              BASE_URL="${BASE_URL:-https://muhkampro.com}" \
+              SUPER_ADMIN_PIN="${SUPER_ADMIN_PIN:-}" \
+              pm2 start dist/index.mjs \
+                --name muhkam-api \
+                --cwd "$APP_DIR/artifacts/api-server"
+            pm2 save
+            # التحقق من تشغيل Redis باستخدام نفس إعدادات التطبيق
+            if [ -n "${REDIS_URL:-}" ]; then
+              if redis-cli -u "$REDIS_URL" ping > /dev/null 2>&1; then
+                echo "✓ Redis متاح عبر REDIS_URL"
+              else
+                echo "تحذير: Redis URL غير متاح — بعض الخدمات ستستخدم fallback"
+              fi
+            elif [ -n "${REDIS_HOST:-}" ]; then
+              if [ -n "${REDIS_PASSWORD:-}" ]; then
+                REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli -h "$REDIS_HOST" -p "${REDIS_PORT:-6379}" ping > /dev/null 2>&1
+              else
+                redis-cli -h "$REDIS_HOST" -p "${REDIS_PORT:-6379}" ping > /dev/null 2>&1
+              fi
+              if [ "$?" -eq 0 ]; then
+                echo "✓ Redis متاح عبر REDIS_HOST/REDIS_PORT"
+              else
+                echo "تحذير: Redis host غير متاح — بعض الخدمات ستستخدم fallback"
+              fi
+            else
+              echo "تحذير: Redis غير مضبوط — التطبيق سيعمل ببعض fallbacks داخلية"
+            fi
+
+            sudo cp "$APP_DIR/deploy/nginx.conf" /etc/nginx/sites-available/muhkampro
+            sudo nginx -t && sudo nginx -s reload
+
+            echo "--- انتظار تشغيل الـ API (حد أقصى 60 ثانية) ---"
+            MAX=24
+            i=0
+            until curl -sf http://localhost:8080/api/healthz > /dev/null 2>&1; do
+              i=$((i+1))
+              if [ "$i" -ge "$MAX" ]; then
+                echo "❌ فشل التشغيل بعد 60 ثانية — آخر لوجز:"
+                pm2 logs muhkam-api --lines 50 --nostream || true
+                echo "--- أسماء متغيرات البيئة المتاحة لـ PM2 (الأسماء فقط، بدون قيم) ---"
+                pm2 env 0 2>/dev/null | sed -E 's/=.*/=<redacted>/' || true
+                exit 1
+              fi
+              echo "  انتظار... ($((i*3))/60 ثانية)"
+              sleep 3
+            done
+            echo "✅ Deploy complete — muhkampro.com is live"
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+          SUPER_ADMIN_PIN: ${{ secrets.SUPER_ADMIN_PIN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          command_timeout: 30s
+          script: |
+            RESPONSE=$(curl -sf http://localhost:8080/api/healthz)
+            echo "OK — $RESPONSE — muhkampro.com is live!"

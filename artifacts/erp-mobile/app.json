@@ -1,0 +1,53 @@
+{
+  "expo": {
+    "name": "مُحكم ERP",
+    "slug": "erp-mobile",
+    "version": "1.0.0",
+    "owner": "mohamedelmelegy",
+    "orientation": "portrait",
+    "icon": "./assets/images/muhkam-logo.png",
+    "scheme": "erp-mobile",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/muhkam-logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#090c14"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.halaltec.muhkam"
+    },
+    "android": {
+      "backgroundColor": "#090c14",
+      "package": "com.halaltec.muhkam",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/muhkam-logo.png",
+        "backgroundColor": "#000000"
+      }
+    },
+    "web": {
+      "favicon": "./assets/images/muhkam-logo.png"
+    },
+    "plugins": [
+      [
+        "expo-router",
+        {
+          "origin": "https://replit.com/"
+        }
+      ],
+      "expo-font",
+      "expo-web-browser"
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    },
+    "extra": {
+      "apiUrl": "https://muhkampro.com",
+      "eas": {
+        "projectId": "888ce3d3-645a-42cc-96ce-b5ac141e2e2b"
+      }
+    }
+  }
+}

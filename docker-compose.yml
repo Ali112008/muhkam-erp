@@ -1,0 +1,95 @@
+version: '3.9'
+
+# MUHKAM ERP — Docker Compose
+# ULTIMATE: muhkampro.com/
+# ADVANCED: muhkampro.com/muhkam-advanced/
+# API:      muhkampro.com/api/
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: muhkam-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: erpuser
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-localpassword}
+      POSTGRES_DB: erp
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erpuser -d erp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: muhkam-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: artifacts/api-server/Dockerfile
+    container_name: muhkam-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://erpuser:${DB_PASSWORD:-localpassword}@postgres:5432/erp
+      JWT_SECRET: ${JWT_SECRET:-change-this-in-production}
+      # مفتاح توقيع رموز التحديث — مطلوب، يختلف عن JWT_SECRET
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      # مفتاح تشفير رموز TOTP — مطلوب لميزة المصادقة الثنائية
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
+      REDIS_URL: redis://redis:6379
+      PORT: 8080
+      NODE_ENV: production
+      ALLOWED_ORIGINS: https://muhkampro.com
+      BACKUP_DIR: /app/backups
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+    volumes:
+      - api_backups:/app/backups
+      # ULTIMATE frontend static files
+      - ./artifacts/erp-system/dist/public:/app/erp-system/dist/public:ro
+      # ADVANCED frontend static files
+      - ./artifacts/muhkam-advanced/dist/public:/app/muhkam-advanced/dist/public:ro
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  nginx:
+    image: nginx:alpine
+    container_name: muhkam-nginx
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/sites-available/muhkampro:ro
+      - nginx_certs:/etc/letsencrypt:ro
+
+volumes:
+  postgres_data:
+  api_backups:
+  nginx_certs:
+  redis_data:

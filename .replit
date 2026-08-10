@@ -1,0 +1,98 @@
+modules = ["nodejs-20", "web", "bash", "postgresql-16", "python-3.11"]
+
+  [[artifacts]]
+  id = "artifacts/api-server"
+
+  [[artifacts]]
+  id = "artifacts/mockup-sandbox"
+
+  [[artifacts]]
+  id = "artifacts/erp-mobile"
+
+  [deployment]
+  router = "application"
+  deploymentTarget = "autoscale"
+  run = ["bash", "-c", "NODE_ENV=production node --enable-source-maps ./artifacts/api-server/dist/index.mjs"]
+  build = ["bash", "-c", "pnpm --filter @workspace/erp-system run build && pnpm --filter @workspace/api-server run build && pnpm --filter @workspace/db run push-force"]
+
+  [deployment.postBuild]
+  args = ["pnpm", "store", "prune"]
+  env = { "CI" = "true" }
+
+  [workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "type-check"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "lint"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "test"
+
+[[workflows.workflow]]
+name = "type-check"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pnpm --filter @workspace/erp-system type-check"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "lint"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pnpm --filter @workspace/erp-system lint"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+[[workflows.workflow]]
+name = "test"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pnpm --filter @workspace/erp-system test"
+
+[workflows.workflow.metadata]
+isValidation = true
+
+  [agent]
+stack = "BEST_EFFORT_FALLBACK"
+expertMode = true
+  integrations = ["github:1.0.0"]
+
+  [postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 120000
+
+  [nix]
+channel = "stable-25_05"
+packages = ["gh", "pm2"]
+
+  [userenv]
+
+  [userenv.shared]
+  NODE_ENV = "development"
+  ALLOWED_ORIGINS = ""
+JWT_SECRET = "38b267cbc60e50b82622195454ff681210303c73b5571c67ccb13421af7e50ecde6c75ba4e7745d14456f1b340c440f7"
+DEFAULT_ADMIN_PIN = "202020"
+JWT_REFRESH_SECRET = "b16534f4c44b384c2860e1a7cf117b876161c81fa34dfc3b7065371f18ed199f9fd79ff3165f6888fd99d5db31076be0"
+TOTP_ENCRYPTION_KEY = "2ac4c9c97d46d2f2024be45cc81c507f09e4e2419a59d104cc85f649e48eaaa7"
+BACKUP_ENCRYPTION_KEY = "13bf5d362471d6db75e66cb6d3617653891c91f8b22564201dbfb8634007706b"
+  

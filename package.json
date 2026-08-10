@@ -1,0 +1,71 @@
+{
+  "name": "workspace",
+  "version": "0.0.0",
+  "license": "MIT",
+  "scripts": {
+    "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*) ;; *) echo \"Use pnpm instead\" >&2; exit 1 ;; esac'",
+    "build": "pnpm run typecheck && pnpm -r --if-present run build",
+    "typecheck:libs": "tsc --build",
+    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck",
+    "lint": "pnpm --filter @workspace/api-server lint && pnpm --filter @workspace/erp-system lint && pnpm --filter @workspace/scripts check-repair-coverage",
+    "lint:fix": "pnpm --filter @workspace/api-server lint:fix && pnpm --filter @workspace/erp-system lint:fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "pnpm --filter @workspace/api-server test && pnpm --filter @workspace/erp-system test",
+    "test:all": "pnpm --filter @workspace/api-server test && pnpm --filter @workspace/erp-system test",
+    "test:e2e": "playwright test",
+    "type-check": "pnpm --filter @workspace/api-server type-check && pnpm --filter @workspace/erp-system type-check",
+    "check": "pnpm run lint && pnpm run typecheck && pnpm run test",
+    "fix": "pnpm run lint:fix && pnpm run format",
+    "ci:local": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build",
+    "sync-pages": "pnpm --filter @workspace/scripts sync-pages",
+    "prepare": "husky",
+    "load:test": "pnpm --filter @workspace/scripts load:test"
+  },
+  "lint-staged": {
+    "artifacts/api-server/src/**/*.ts": [
+      "pnpm --filter @workspace/api-server exec eslint --fix",
+      "prettier --write"
+    ],
+    "artifacts/erp-system/src/**/*.{ts,tsx}": [
+      "pnpm --filter @workspace/muhkam-advanced exec eslint --fix",
+      "prettier --write"
+    ],
+    "**/*.{json,css}": [
+      "prettier --write"
+    ]
+  },
+  "private": true,
+  "pnpm": {
+    "overrides": {
+      "@types/react": "^19.2.0",
+      "@types/react-dom": "^19.2.0",
+      "@xmldom/xmldom": "^0.9.10",
+      "esbuild": "^0.25.0",
+      "uuid": "^14.0.0",
+      "postcss": "^8.5.10",
+      "@expo/metro-config>postcss": "^8.5.10",
+      "jspdf": "^4.2.1",
+      "dompurify": "^3.4.2",
+      "ip-address": "^10.1.1",
+      "@opentelemetry/api": "^1.9.1",
+      "shell-quote": "file:patches/shell-quote"
+    },
+    "patchedDependencies": {
+      "@expo/metro-config@54.0.14": "patches/@expo__metro-config@54.0.14.patch"
+    }
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "eslint-config-prettier": "^10.1.5",
+    "eslint-plugin-prettier": "^5.4.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.5.1",
+    "prettier": "^3.8.1",
+    "typescript": "~5.9.2"
+  },
+  "dependencies": {
+    "express-rate-limit": "^8.3.1",
+    "helmet": "^8.1.0"
+  }
+}
